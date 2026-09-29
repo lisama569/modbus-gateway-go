@@ -27,6 +27,8 @@ const (
 	KindAddress
 	// KindPartial 批量读取部分点位失败
 	KindPartial
+	// KindUncertain 写入请求可能已生效但无法确认最终状态
+	KindUncertain
 )
 
 // Error 携带错误分类、归一化原因以及触发判定的原始报文。
@@ -88,6 +90,8 @@ func kindText(k ErrorKind) string {
 		return "invalid address or quantity"
 	case KindPartial:
 		return "partial read failure"
+	case KindUncertain:
+		return "write outcome uncertain"
 	default:
 		return "unknown error"
 	}

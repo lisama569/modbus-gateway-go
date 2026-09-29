@@ -78,4 +78,31 @@ func main() {
 	}
 	fmt.Printf("retry recovered, counter=%v, overall OK=%v\n",
 		res2.Results[1].Value, res2.OK)
+
+	fmt.Println("== 控制回路:安全批量写入(设定值 + 开关量) ==")
+	wres, werr := gw.WriteItems([]mapping.WriteItem{
+		{Point: points[0], Value: float32(40.0)}, // setpoint
+		{Point: points[1], Value: uint32(4321)},  // counter(DCBA)
+		{Point: points[2], Value: true},          // running 线圈
+	})
+	if werr != nil {
+		log.Fatalf("write batch: %v", werr)
+	}
+	for _, r := range wres.Results {
+		fmt.Printf("written point=%-12s attempts=%d confirmed=%v\n",
+			r.Point.Name, r.Attempts, r.Confirmed)
+	}
+
+	fmt.Println("== 写入请求已生效但响应连续丢失:读回确认后报成功 ==")
+	target := mapping.Point{Name: "sp2", Area: mapping.AreaHoldingRegisters,
+		Address: 10, Type: mapping.TypeFloat32, Order: mapping.BigEndian}
+	slave.AddInject(&modbus.InjectRule{
+		Function: modbus.FCWriteMultipleRegisters,
+		Drop:     true, ApplyThenDrop: true, Remaining: 2})
+	cres, cerr := gw.WriteItems([]mapping.WriteItem{{Point: target, Value: float32(99.5)}})
+	if cerr != nil {
+		log.Fatalf("write must be confirmed via read-back: %v", cerr)
+	}
+	fmt.Printf("confirmed outcome: attempts=%d confirmed=%v OK=%v\n",
+		cres.Results[0].Attempts, cres.Results[0].Confirmed, cres.OK)
 }

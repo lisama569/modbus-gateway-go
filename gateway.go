@@ -75,6 +75,41 @@ func (g *Gateway) ReadPoints(points []mapping.Point) (*mapping.BatchResult, erro
 	return mapping.ReadBatch(g.client, points)
 }
 
+// safeWriter 把客户端的"安全写入+读回确认"能力适配为 mapping.RegisterWriter。
+type safeWriter struct{ c *modbus.Client }
+
+// writeErr 透传底层错误分类(不确定语义)与物理写入尝试次数。
+type writeErr struct {
+	err      error
+	attempts int
+}
+
+func (e *writeErr) Error() string          { return e.err.Error() }
+func (e *writeErr) Unwrap() error          { return e.err }
+func (e *writeErr) UncertainOutcome() bool { return modbus.KindOf(e.err) == modbus.KindUncertain }
+func (e *writeErr) WriteAttempts() int     { return e.attempts }
+
+func (s safeWriter) WriteCoils(addr uint16, bits []bool) (int, error) {
+	n, err := s.c.SafeWriteCoils(addr, bits)
+	if err != nil {
+		return n, &writeErr{err: err, attempts: n}
+	}
+	return n, nil
+}
+
+func (s safeWriter) WriteRegisters(addr uint16, regs []uint16) (int, error) {
+	n, err := s.c.SafeWriteRegisters(addr, regs)
+	if err != nil {
+		return n, &writeErr{err: err, attempts: n}
+	}
+	return n, nil
+}
+
+// WriteItems 对给定点位执行一次安全批量写入。
+func (g *Gateway) WriteItems(items []mapping.WriteItem) (*mapping.WriteBatchResult, error) {
+	return mapping.WriteBatch(safeWriter{c: g.client}, items)
+}
+
 // Client 暴露底层客户端,供直接按功能码访问。
 func (g *Gateway) Client() *modbus.Client { return g.client }
 

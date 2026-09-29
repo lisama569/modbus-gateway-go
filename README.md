@@ -16,12 +16,24 @@ pkg/modbus/
   codec_ascii.go  ASCII 分帧(':' 起始、CRLF 结束、LRC 校验)
   slave.go        内存模拟从站(四区数据)、故障注入、本地回环服务端
   client.go       会话级串行客户端(超时、重试、失效重连)
+pkg/modbus/
+  pdu.go          统一请求/响应模型(PDU 编解码、异常响应识别)
+  frame.go        Frame / Codec / Link 抽象与读错误归一化
+  codec_tcp.go    MBAP 分帧(事务标识、协议标识、长度字段校验)
+  codec_rtu.go    RTU 分帧(CRC16、无长度字段的帧长度推断)
+  codec_ascii.go  ASCII 分帧(':' 起始、CRLF 结束、LRC 校验)
+  slave.go        内存模拟从站(四区数据)、故障注入、本地回环服务端
+  client.go       会话级串行客户端(超时、重试、失效重连)
+  safe_write.go   安全写入状态机(明确拒绝不重发、不确定恢复+读回确认)
 pkg/mapping/
   types.go        点位 / 数据类型 / 字节序 / 批量结果模型
   decode.go       字序、字节序与数据类型的确定性兼容转换
+  encode.go       写入值的反向编码(DecodeValue 的逆过程)
   batch.go        跨区/超容量批量读取的确定性拆分与部分失败汇总
+  write.go        批量写入的校验、确定性拆分、安全执行与部分失败汇总
+  classify.go     底层写入错误的不确定语义/尝试次数适配
 cmd/modbus-gateway/  本地验证示例程序
-gateway.go        顶层组装(模拟从站 + 客户端 + 映射点位)
+gateway.go        顶层组装(模拟从站 + 客户端 + 映射点位 + 读写批次)
 ```
 
 ## 支持的传输形态
@@ -69,7 +81,8 @@ gateway.go        顶层组装(模拟从站 + 客户端 + 映射点位)
 | `KindTimeout` | 请求在超时时间内**一个字节都没收到**（对端完全不响应） |
 | `KindClosed` | 连接被关闭或拨号失败 |
 | `KindAddress` | 起始地址/数量非法（0、超上限、越界、单线圈值非 0x0000/0xFF00） |
-| `KindPartial` | 批量读取中存在失败点位（成功部分仍完整保留） |
+| `KindPartial` | 批量读取/写入中存在失败点位（成功部分仍完整保留） |
+| `KindUncertain` | 写请求可能已生效但无法确认最终状态（响应丢失且读回无法定论） |
 
 **超时与长度不符的区分**（关键）：对端完全不响应 → 读超时为 `KindTimeout`；
 TCP 声明了长度、也确实收到了部分体字节但在超时/断开前没收满 →
@@ -129,17 +142,100 @@ TCP 声明了长度、也确实收到了部分体字节但在超时/断开前没
 - `Succeeded` / `Failed` 计数明确；全部成功时 `OK=true` 且 `error==nil`，
   存在失败时返回归一化的 partial 错误，**已成功部分仍完整保留**。
 
+## 控制回路：安全批量写回
+
+写回入口为 `Gateway.WriteItems([]mapping.WriteItem)`（底层
+`mapping.WriteBatch` + `modbus.Client.SafeWriteCoils/SafeWriteRegisters`）。
+
+### 可写范围与单项失败
+
+| 数据区 | 是否可写 | 使用功能码 |
+|--------|----------|-----------|
+| 线圈 Coils (0x05/0x0F 区) | 可写 | 点位类型必须为 `Bool`，下发开关量；批量统一走 FC0F |
+| 保持寄存器 Holding (0x06/0x10 区) | 可写 | 按点位既有类型与字节序，反向写入 16/32/64 位整数或浮点；批量走 FC10 |
+| 离散输入 Discrete Inputs | **只读** | 写入按单项失败（`plan`），不上线 |
+| 输入寄存器 Input Registers | **只读** | 同上 |
+
+以下情况一律作为**明确的单项失败**返回，绝不静默跳过、绝不写到别的点位：
+
+- 只读区域点位；线圈点不是 `Bool` / 寄存器点是 `Bool`；
+- Go 值类型与点位数据类型不严格匹配（`int16/uint16/int32/...` 宽度不混用、
+  `float32` 不接受 `float64` 字面量、NaN/Inf 拒绝），错误 Kind 为 `value`；
+- 地址 + 宽度越过 0..65535；
+- **同一批次内地址区间重叠**（含一个宽点覆盖另一点）：冲突双方都判 `plan` 失败，
+  避免"后写覆盖先写"的不确定结果；
+- 底层写入被对端明确拒绝或参数非法（Kind 为 `transport`）；
+- 恢复确认用尽仍无法判定（Kind 为 `uncertain`，表示**值可能已生效**）。
+
+### 类型与字节序的反向转换
+
+`mapping.EncodeValue` 是 `DecodeValue` 的严格逆过程：归一化值先按大端展开，
+再按与解码相同的自逆字节/字序置换映射回"按地址先后"的寄存器序列。支持的线路
+布局与读取完全对称：
+
+- uint16/int16 固定大端（单寄存器，忽略字节序）；
+- uint32/int32/float32 支持 ABCD / DCBA / CDAB / BADC；
+- uint64/int64/float64 占 4 个寄存器，同样四种字节序；
+- 编码后再解码必得到原值（`Encode ∘ Decode` 往返单测覆盖全部类型 × 全部字节序）。
+
+### 写入拆分与部分失败规则
+
+拆分规则与读取**同一套确定性规则**，并额外保证写覆盖范围精确：
+
+1. **跨区域绝不合并**（线圈 FC0F 与寄存器 FC10 地址空间不同）。
+2. 组内按起始地址升序（同地址按原始下标稳定排序），区域遍历顺序固定，
+   因此同一点位集合的拆分与输入顺序无关。
+3. **只合并相邻且连续**的点位：两个点位之间若存在地址间隙，绝不允许一段
+   FC0F/FC10 顺带改写任何间隙地址（写与读不同，不能覆盖目标集合以外的单元）。
+4. 超过单帧容量（线圈 **1968**、寄存器 **123**）按帧起点贪心拆帧；
+   宽点位整体落在一帧或整体进入新帧，**绝不跨帧拆分**。
+5. `WriteBatchResult.Results` 与输入**同序一一对应**；某片段失败只令其覆盖的
+   点位失败，已成功（已确认）点位的结果完整保留、可见。
+6. `Succeeded`/`Failed` 计数明确：`OK=true` 当且仅当全部确认成功；存在失败时
+   返回归一化 partial 错误（整体结论可区分"全部成功"与"部分失败"）。
+   `SegmentErrors` 与片段一一对应；每个结果还带 `Attempts`（物理写入次数）
+   与 `Confirmed`（是否经过读回确认）。
+
+### 恢复与确认语义（安全写入状态机）
+
+`modbus.Client.SafeWriteCoils/SafeWriteRegisters` 对每个片段执行：
+
+1. **对端明确答复不重发**：异常响应（非法地址/数据值/功能码）、本地参数非法
+   立刻失败，物理写入恰好一次；这类答复明确，重复下发没有意义。
+2. **仅不确定错误才恢复**：超时、连接失效、帧截断/校验/长度/事务标识错误——
+   这些情况下"请求可能已生效但响应丢失"。恢复前先**关闭并重建连接**，
+   旧连接上的迟到响应随连接丢弃；每次物理写都是新连接上的**新事务标识**，
+   因此迟到响应不可能被当作新写的回显，也不会把重复写入混成新结果。
+3. **通过读回判断最终状态**：不确定后用 FC01/FC03 读回目标地址区间，与期望值
+   逐位/逐寄存器比对——
+   - 读回一致：**即使写响应全部丢失，也报成功**（不能把实际成功的控制量报失败）；
+   - 读回可靠但不一致：写确实未生效，进入下一轮"重发 + 确认"；
+   - 读回本身也不确定（超时/连接失效）：继续下一轮；
+   - 读回被明确拒绝（无法再经读回判定）：立即返回 `KindUncertain`；
+   - 恢复轮数有上限（`maxWriteConfirmRounds=2`，加上首次至多 3 次物理写），
+     用尽后返回 `KindUncertain`——**既不盲报成功也不盲报失败**，上层据此把
+     对应点位标记为 `uncertain` 单项失败（值可能已生效）。
+4. **并发不串台**：写入与读回确认在同一把会话串行锁内完成，整个
+   "写→不确定→重连→重发→读回确认"是一个不可插队的原子会话；并发写各自使用
+   独立事务与（恢复时）独立连接，结果严格各归各。已通过 `-race` 并发测试。
+
+`*modbus.Error` 新增分类 `KindUncertain`（"write outcome uncertain"）。
+
 ## 模拟从站与故障注入
 
 `modbus.NewSlave(size)` 创建四个数据区的内存从站，可用 `SetHolding/SetInput/
 SetCoil/SetDiscrete` 预置数据。`slave.AddInject(&modbus.InjectRule{...})` 支持：
 
-- `Drop`：丢弃请求不响应（复现超时）；
+- `Drop`：丢弃请求不响应（复现超时）；丢弃后该连接进入排空状态直到主站关闭，
+  保证丢弃帧不会产生迟到响应污染重连后的新事务；
+- `ApplyThenDrop`：写请求**先正常落数据再丢弃响应**，精确模拟
+  "请求已生效但响应丢失"，用于验证读回确认；
 - `Delay`：延迟响应；
 - `CorruptChecksum`：破坏 RTU CRC / ASCII LRC；
 - `CorruptLength`：破坏 TCP 长度字段（RTU/ASCII 退化为校验破坏）；
 - `CorruptTransaction`：破坏 TCP 事务标识；
 - `Exception`：返回指定异常码的异常响应；
+- `NoApply`：写请求回显成功但**不改动数据区**（"响应成功而值未生效"）；
 - `Remaining`：剩余生效次数（-1 永久，1 仅一次，用于"首次失败重试成功"）。
 
 规则按添加顺序匹配，功能码为 0 表示对所有码生效。
@@ -147,16 +243,23 @@ SetCoil/SetDiscrete` 预置数据。`slave.AddInject(&modbus.InjectRule{...})` �
 ## 本地验证方法
 
 ```bash
-# 运行全部单元/集成测试（含畸形报文、校验、超时重试、连接重建、并发）
+# 运行全部单元/集成测试
+# (含畸形报文、校验、超时重试、连接重建、并发,以及写入编码往返、容量拆分、
+#  部分失败、明确拒绝不重试、不确定写入恢复/读回确认、并发下发不串台)
 go test ./... -count=1
 
 # 带竞态检测的并发验证
 go test -race ./... -count=1
 
+# 只看写回相关用例(编码往返/拆分/部分失败 在 mapping,安全写入状态机在 modbus)
+go test ./pkg/mapping/ -run 'TestEncode|TestWrite' -v -count=1
+go test ./pkg/modbus/ -run TestSafeWrite -v -count=1
+go test ./ -run TestEndToEnd.*Write -v -count=1
+
 # 查看单测日志：打印原始报文 raw=... 与归一化判定 normalized=...
 go test ./pkg/modbus/ -v -count=1
 
-# 可执行示例：正常批量读取 + 注入一次丢弃后的超时重试恢复
+# 可执行示例：批量读取 + 超时重试恢复 + 安全批量写入 + 响应丢失后读回确认
 go run ./cmd/modbus-gateway -transport tcp
 go run ./cmd/modbus-gateway -transport rtu
 go run ./cmd/modbus-gateway -transport ascii
@@ -187,4 +290,10 @@ defer gw.Close()
 gw.Slave().SetHolding(0, 0x4212)
 gw.Slave().SetHolding(1, 0x6666) // float32 36.6
 res, err := gw.ReadAll()
+
+// 安全批量写回:设定值 + 开关量;返回结果与输入同序,部分失败时成功部分保留。
+wres, werr := gw.WriteItems([]mapping.WriteItem{
+    {Point: points[0], Value: float32(40.0)},
+    {Point: points[2], Value: true},
+})
 ```

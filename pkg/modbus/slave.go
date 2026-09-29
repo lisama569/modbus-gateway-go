@@ -14,6 +14,9 @@ type InjectRule struct {
 	Function FunctionCode
 	// Drop 为 true 时直接丢弃请求不响应(用于触发主站超时)。
 	Drop bool
+	// ApplyThenDrop 为 true 时,写请求先正常执行(数据区落盘)再丢弃响应,
+	// 精确模拟"请求已生效但响应丢失"的不确定场景;仅对写功能码有意义。
+	ApplyThenDrop bool
 	// Delay 在响应前强制等待。
 	Delay time.Duration
 	// CorruptChecksum 破坏 RTU CRC / ASCII LRC(TCP 无意义)。
@@ -24,6 +27,9 @@ type InjectRule struct {
 	CorruptTransaction bool
 	// Exception 非 0 时返回该异常码的异常响应(优先级低于 Drop)。
 	Exception ExceptionCode
+	// NoApply 为 true 时对写请求返回正常回显但不实际改动数据区,
+	// 用于复现"响应称成功但值未生效"以及"请求已到达、响应丢失后读回确认"。
+	NoApply bool
 	// Remaining 为规则剩余生效次数;-1 表示永久生效。
 	Remaining int
 }
@@ -174,6 +180,10 @@ func (s *Slave) handle(f *Frame) (resp *Frame, rule *InjectRule) {
 			time.Sleep(rule.Delay)
 		}
 		if rule.Drop {
+			// 先落数据再静默:模拟写请求已被设备执行、但响应在链路中丢失。
+			if rule.ApplyThenDrop && !isReadFC(req.Function) {
+				_ = s.serveData(req, nil)
+			}
 			return nil, rule
 		}
 		if rule.Exception != 0 {
@@ -182,18 +192,27 @@ func (s *Slave) handle(f *Frame) (resp *Frame, rule *InjectRule) {
 		}
 	}
 
-	pdu := s.serveData(req)
+	pdu := s.serveData(req, rule)
 	return &Frame{Unit: f.Unit, TransactionID: f.TransactionID, PDU: pdu}, rule
 }
 
 // serveData 在锁保护下读写数据区并构造正常/异常响应 PDU。
-func (s *Slave) serveData(req *Request) []byte {
+func (s *Slave) serveData(req *Request, rule *InjectRule) []byte {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	size := len(s.holding)
 	checkRange := func(addr, qty uint16) bool {
 		return int(addr)+int(qty) <= size
+	}
+
+	// NoApply:写请求返回正常回显但不改动数据区,模拟"响应成功但未生效",
+	// 供主站读回确认与"可能已生效"语义测试。
+	if rule != nil && rule.NoApply && !isReadFC(req.Function) {
+		r := &Response{Function: req.Function, Address: req.Address,
+			Value: req.Value, Quantity: req.Quantity}
+		p, _ := r.EncodePDU()
+		return p
 	}
 
 	switch req.Function {
@@ -423,9 +442,11 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 		}
 		resp, rule := s.slave.handle(f)
 		if resp == nil {
-			// Drop: 不回任何字节,等待主站超时后关闭连接。
-			// 服务端保持连接,继续尝试读下一帧(实际主站会关闭)。
-			continue
+			// Drop: 不回任何字节。此后该连接进入"排空"状态:继续读取并丢弃
+			// 后续帧但绝不响应,直到主站超时关闭连接(EOF)。这样主站侧稳定得到
+			// 超时判定,且重连前残留在本连接上的帧也不会产生迟到响应混入新事务。
+			s.drainUntilClosed(conn)
+			return
 		}
 		out, err := s.codec.Encode(resp)
 		if err != nil {
@@ -433,6 +454,15 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 		}
 		out = s.applyCorruption(out, rule)
 		_, _ = conn.Write(out)
+	}
+}
+
+// drainUntilClosed 在 Drop 之后排空连接:读到帧也不响应,直到连接关闭。
+func (s *Server) drainUntilClosed(conn net.Conn) {
+	for {
+		if _, err := s.codec.Decode(conn, DirRequest); err != nil {
+			return
+		}
 	}
 }
 
