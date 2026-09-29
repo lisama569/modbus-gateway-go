@@ -78,4 +78,47 @@ func main() {
 	}
 	fmt.Printf("retry recovered, counter=%v, overall OK=%v\n",
 		res2.Results[1].Value, res2.OK)
+
+	fmt.Println("== 批量写回:线圈开关 + 保持寄存器设定值 ==")
+	wres, werr := gw.WriteAll(map[string]any{
+		"temperature": float32(37.2),
+		"counter":     uint32(4321),
+		"running":     true,
+	}, mapping.WriteConfig{MaxAttempts: 3})
+	if werr != nil {
+		log.Fatalf("write batch: %v", werr)
+	}
+	for _, r := range wres.Results {
+		fmt.Printf("written point=%-12s value=%v attempts=%d confirmed=%v\n",
+			r.Point.Name, r.Value, r.Attempts, r.Confirmed)
+	}
+
+	fmt.Println("== 写入响应丢失但设备已生效:期望读回确认成功且不重复下发 ==")
+	// 用 Retry=0 的独立网关演示 mapping 层的读回确认:客户端重试预算为 0,
+	// 首次 FC10 超时后由 mapping 层读回比对,发现已落地即判确认成功。
+	confirmPoints := []mapping.Point{
+		{Name: "target", Area: mapping.AreaHoldingRegisters, Address: 20,
+			Type: mapping.TypeUint32, Order: mapping.BigEndian},
+	}
+	cgw, cerr := gateway.Start(gateway.Config{
+		Transport: modbus.Transport(*transport), Unit: 1, Timeout: 500 * time.Millisecond,
+		Retry: 0, Points: confirmPoints,
+	}, slave)
+	if cerr != nil {
+		log.Fatalf("start confirm gateway: %v", cerr)
+	}
+	defer cgw.Close()
+	// 让从站先落地写入再丢响应。
+	slave.AddInject(&modbus.InjectRule{
+		Function: modbus.FCWriteMultipleRegisters, Drop: true,
+		ApplyBeforeDrop: true, Remaining: 1})
+	cres, cerr := cgw.WriteAll(map[string]any{"target": uint32(0x000007D0)},
+		mapping.WriteConfig{MaxAttempts: 3})
+	if cerr != nil {
+		log.Fatalf("write confirm: %v", cerr)
+	}
+	for _, r := range cres.Results {
+		fmt.Printf("confirmed point=%s attempts=%d confirmed=%v (0x07D0=2000 已落地,未重复下发)\n",
+			r.Point.Name, r.Attempts, r.Confirmed)
+	}
 }

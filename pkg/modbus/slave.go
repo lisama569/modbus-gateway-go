@@ -14,6 +14,9 @@ type InjectRule struct {
 	Function FunctionCode
 	// Drop 为 true 时直接丢弃请求不响应(用于触发主站超时)。
 	Drop bool
+	// ApplyBeforeDrop 为 true 且 Drop 为 true 时,先把写请求正常应用到数据区,
+	// 再丢弃响应 —— 复现"请求可能已生效但响应丢失"的不确定场景。
+	ApplyBeforeDrop bool
 	// Delay 在响应前强制等待。
 	Delay time.Duration
 	// CorruptChecksum 破坏 RTU CRC / ASCII LRC(TCP 无意义)。
@@ -174,6 +177,10 @@ func (s *Slave) handle(f *Frame) (resp *Frame, rule *InjectRule) {
 			time.Sleep(rule.Delay)
 		}
 		if rule.Drop {
+			if rule.ApplyBeforeDrop {
+				// 先应用写请求到数据区,再丢弃响应:模拟生效但应答丢失。
+				_ = s.serveData(req)
+			}
 			return nil, rule
 		}
 		if rule.Exception != 0 {

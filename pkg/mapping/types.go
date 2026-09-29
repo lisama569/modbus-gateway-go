@@ -1,4 +1,4 @@
-// Package mapping 提供 Modbus 点位映射、数据类型兼容转换与批量读取拆分。
+// Package mapping 提供 Modbus 点位映射、数据类型兼容转换、批量读取拆分与批量写回。
 package mapping
 
 // Area 是 Modbus 数据区。

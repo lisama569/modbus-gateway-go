@@ -51,6 +51,11 @@ func (e *Error) Error() string {
 
 func (e *Error) Unwrap() error { return e.Cause }
 
+// Retryable 判断该错误是否属于"不确定"类:超时、连接失效、截断、校验、
+// 长度/事务标识错误允许恢复重试;异常响应、非法地址/数据值、不支持功能码
+// 属对端明确答复,不可重试。
+func (e *Error) Retryable() bool { return retryable(e) }
+
 // KindOf 返回任意错误对应的 ErrorKind,未知错误归为 KindUnknown。
 func KindOf(err error) ErrorKind {
 	for err != nil {

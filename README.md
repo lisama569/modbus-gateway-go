@@ -18,8 +18,10 @@ pkg/modbus/
   client.go       会话级串行客户端(超时、重试、失效重连)
 pkg/mapping/
   types.go        点位 / 数据类型 / 字节序 / 批量结果模型
-  decode.go       字序、字节序与数据类型的确定性兼容转换
+  decode.go       字序、字节序与数据类型的确定性兼容转换(读取方向)
+  encode.go       解码的严格逆过程:归一化值 -> 寄存器(写回方向)
   batch.go        跨区/超容量批量读取的确定性拆分与部分失败汇总
+  write.go        批量写回:可写校验、确定性拆分、恢复与读回确认
 cmd/modbus-gateway/  本地验证示例程序
 gateway.go        顶层组装(模拟从站 + 客户端 + 映射点位)
 ```
@@ -129,12 +131,96 @@ TCP 声明了长度、也确实收到了部分体字节但在超时/断开前没
 - `Succeeded` / `Failed` 计数明确；全部成功时 `OK=true` 且 `error==nil`，
   存在失败时返回归一化的 partial 错误，**已成功部分仍完整保留**。
 
+## 批量写回（控制回路）
+
+在同一份点表之上新增写回能力：线圈下发开关量，保持寄存器按点位既有类型与字节序
+**反向编码**下发 16/32/64 位整数或浮点值。入口为 `mapping.WriteBatch`，
+网关层对应 `gw.WriteAll(values, cfg)` 与 `gw.WriteRequests(reqs, cfg)`。
+
+### 可写范围与单项失败
+
+| 数据区 | 是否可写 | 下发功能码 |
+|--------|----------|-----------|
+| 线圈 Coils（0x） | ✅ | 单点 0x05，连续多点 0x0F |
+| 保持寄存器 Holding（4x） | ✅ | 单寄存器点 0x06，连续多点 0x10 |
+| 离散输入 Discrete Inputs（1x） | ❌ 只读 | 不产生任何下发 |
+| 输入寄存器 Input Registers（3x） | ❌ 只读 | 不产生任何下发 |
+
+以下情况都作为**明确的单项失败**返回（`WriteResult.Err`），不会静默跳过，
+也绝不会写到别的点位，且不产生任何物理报文：
+
+- 点位落在离散输入 / 输入寄存器等只读区；
+- 值的 Go 类型与点位类型不**严格一致**（不做隐式数值转换，例如 `TypeUint32`
+  只接受 `uint32`，传 `uint16`/`int`/`nil` 均失败）；
+- 位区点位不是 `TypeBool`，或寄存器点位是 `TypeBool`；
+- 地址 + 宽度越过 0..65535；
+- 任意两个合法点位的写入区间**重叠**（冲突双方都判失败，避免一帧内对同一地址
+  给出两个值或漏写其一）。
+
+### 类型与字节序反向转换
+
+`mapping.EncodeValue(t, order, value)` 是 `DecodeValue` 的**严格逆过程**：
+同一类型同一字节序，解码后的值再编码得到的寄存器与原线路字节逐位一致，反之亦然
+（单测 `TestEncodeDecodeRoundTrip` 覆盖九种类型 × 四种字节序）。值与类型的
+对应关系：
+
+`bool→Bool`、`uint16/int16→16位`、`uint32/int32/float32→32位`、
+`uint64/int64/float64→64位`。16 位类型固定按 Modbus 标准大端输出（忽略字节序）；
+32/64 位按点位 `Order` 决定字序与字内字节序。宽点位占用的多个寄存器作为整体，
+绝不被拆到两帧。
+
+### 写回的确定性拆分规则
+
+与读取的关键区别：**不能顺带改写不属于请求的间隙地址**。
+
+1. 跨区绝不合并；组内按地址升序（同地址按原始下标）稳定排序。
+2. 仅当候选点位地址与当前帧尾**严格连续**（中间无间隙）且并入后不超过单帧容量时
+   才合并；有间隙立即另开一帧 —— 间隙地址保持不动。
+3. 单帧容量：线圈 1968（0x0F），寄存器 123（0x10）。宽点位整体进帧，不跨帧。
+4. 单点片段用单写功能码（0x05 / 0x06），多点连续片段用多写（0x0F / 0x10）。
+5. 同一点位集合的拆分结果与输入顺序无关，完全确定。
+
+### 结果规则（同序、保留成功项）
+
+- `WriteBatchResult.Results` 与输入请求**同序一一对应**，每项携带值、
+  物理下发次数 `Attempts`、是否经读回确认 `Confirmed` 与错误；
+  `Segments` / `SegmentErrors` 与片段一一对应。
+- 某片段失败只令其覆盖点位失败，**已成功片段/点位完整保留**。
+- 全部成功 `OK=true, error==nil`；存在失败返回归一化 partial 错误，
+  `Succeeded`/`Failed` 明确，可区分"全部成功"与"部分失败"。
+
+### 恢复与确认语义（安全优先）
+
+写操作区分两类失败，恢复策略不同：
+
+- **明确拒绝 / 参数非法，绝不重发**：异常响应（0x01–0x0B）、非法地址/数据值、
+  不支持功能码等属于对端的确定答复，立即判该片段失败（只下发一次）。
+  这类判定复用 `*modbus.Error` 的错误分类（`Error.Retryable()`）。
+- **不确定失败才允许恢复**：超时、连接失效、帧截断、校验/长度/事务标识错误 ——
+  这些情况下请求**可能已经生效**。此时不盲目重发，而是先**读回**该片段覆盖区间，
+  与期望载荷逐位/逐寄存器比对：
+  - 读回一致 → 判**成功**，`Confirmed=true`，且**不重复下发**
+    （"响应丢失但实际写成功"不会被误报失败）；
+  - 读回不一致或读回本身失败 → 在 `WriteConfig.MaxAttempts`（默认 3）内**重新下发**；
+    0x05/0x06/0x0F/0x10 都是**绝对值写入、幂等**，重发不会产生叠加或歧义；
+  - 次数耗尽后再做一次读回，仍无法确认才判失败 —— **绝不把没确认生效的写入
+    报成成功**。
+  - 读回确认默认开启（`WriteConfig.Confirm` 取 `ConfirmDefault`/`ConfirmOn`）；
+    显式传 `ConfirmOff` 可关闭，此时不确定失败直接在次数内重发、耗尽即失败。
+- 底层客户端在每次物理尝试上仍保持原有保证：串行锁 FIFO、新事务标识、
+  失败即重建连接、旧连接迟到响应随关闭丢弃，因此读回确认与重发都不会把
+  迟到响应或重复写入混成新结果。
+- 并发多批次写回互不串台：每批次独立结果对象、地址区间校验独立，
+  底层请求经串行锁一一配对（`-race` 下有对应用例）。
+
 ## 模拟从站与故障注入
 
 `modbus.NewSlave(size)` 创建四个数据区的内存从站，可用 `SetHolding/SetInput/
 SetCoil/SetDiscrete` 预置数据。`slave.AddInject(&modbus.InjectRule{...})` 支持：
 
 - `Drop`：丢弃请求不响应（复现超时）；
+- `ApplyBeforeDrop`：与 `Drop` 配合，先把写请求正常落地到数据区再丢弃响应，
+  复现"请求已生效但响应丢失"的不确定场景，用于验证读回确认；
 - `Delay`：延迟响应；
 - `CorruptChecksum`：破坏 RTU CRC / ASCII LRC；
 - `CorruptLength`：破坏 TCP 长度字段（RTU/ASCII 退化为校验破坏）；
@@ -147,16 +233,22 @@ SetCoil/SetDiscrete` 预置数据。`slave.AddInject(&modbus.InjectRule{...})` �
 ## 本地验证方法
 
 ```bash
-# 运行全部单元/集成测试（含畸形报文、校验、超时重试、连接重建、并发）
+# 运行全部单元/集成测试
+# （含畸形报文、校验、超时重试、连接重建、并发；以及写回往返转换、容量拆分、
+#   部分失败、明确拒绝不重试、不确定写入读回确认、并发下发不串台）
 go test ./... -count=1
 
 # 带竞态检测的并发验证
 go test -race ./... -count=1
 
+# 只跑写回相关用例（mapping 层与端到端）
+go test ./pkg/mapping/ -run 'TestEncode|TestPlanWrite|TestWriteBatch' -v -count=1
+go test . -run TestEndToEndWrite -v -count=1
+
 # 查看单测日志：打印原始报文 raw=... 与归一化判定 normalized=...
 go test ./pkg/modbus/ -v -count=1
 
-# 可执行示例：正常批量读取 + 注入一次丢弃后的超时重试恢复
+# 可执行示例：批量读取 + 丢弃后重试恢复 + 批量写回 + 响应丢失读回确认
 go run ./cmd/modbus-gateway -transport tcp
 go run ./cmd/modbus-gateway -transport rtu
 go run ./cmd/modbus-gateway -transport ascii
@@ -187,4 +279,10 @@ defer gw.Close()
 gw.Slave().SetHolding(0, 0x4212)
 gw.Slave().SetHolding(1, 0x6666) // float32 36.6
 res, err := gw.ReadAll()
+
+// 批量写回:值类型必须与点位类型严格一致
+wres, werr := gw.WriteAll(map[string]any{
+    "temp": float32(37.2),
+}, mapping.WriteConfig{MaxAttempts: 3})
+// wres.Results 与点位同序;Attempts 为下发次数,Confirmed 表示经读回确认
 ```

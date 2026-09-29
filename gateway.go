@@ -75,6 +75,21 @@ func (g *Gateway) ReadPoints(points []mapping.Point) (*mapping.BatchResult, erro
 	return mapping.ReadBatch(g.client, points)
 }
 
+// WriteAll 对全部已配置点位按 (point, value) 批量写回。
+// values 的键为点位名称;未提供值的点位按单项失败处理。
+func (g *Gateway) WriteAll(values map[string]any, cfg mapping.WriteConfig) (*mapping.WriteBatchResult, error) {
+	reqs := make([]mapping.WriteRequest, 0, len(g.points))
+	for _, p := range g.points {
+		reqs = append(reqs, mapping.WriteRequest{Point: p, Value: values[p.Name]})
+	}
+	return mapping.WriteBatch(g.client, reqs, cfg)
+}
+
+// WriteRequests 对显式给出的写回请求执行批量写回。
+func (g *Gateway) WriteRequests(reqs []mapping.WriteRequest, cfg mapping.WriteConfig) (*mapping.WriteBatchResult, error) {
+	return mapping.WriteBatch(g.client, reqs, cfg)
+}
+
 // Client 暴露底层客户端,供直接按功能码访问。
 func (g *Gateway) Client() *modbus.Client { return g.client }
 
