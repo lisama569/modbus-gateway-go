@@ -21,7 +21,8 @@ pkg/mapping/
   decode.go       字序、字节序与数据类型的确定性兼容转换(读取方向)
   encode.go       解码的严格逆过程:归一化值 -> 寄存器(写回方向)
   batch.go        跨区/超容量批量读取的确定性拆分与部分失败汇总
-  write.go        批量写回:可写校验、确定性拆分、恢复与读回确认
+  write.go        批量写回:可写校验、确定性拆分、批次级隔离、恢复与读回确认
+  locker.go       批次级互斥原语(BatchGuard),保证"下发—确认"整体不可插入
 cmd/modbus-gateway/  本地验证示例程序
 gateway.go        顶层组装(模拟从站 + 客户端 + 映射点位)
 ```
@@ -183,11 +184,44 @@ TCP 声明了长度、也确实收到了部分体字节但在超时/断开前没
 ### 结果规则（同序、保留成功项）
 
 - `WriteBatchResult.Results` 与输入请求**同序一一对应**，每项携带值、
-  物理下发次数 `Attempts`、是否经读回确认 `Confirmed` 与错误；
+  物理下发次数 `Attempts`、是否经读回确认 `Confirmed`、**确定程度 `Status`** 与错误；
   `Segments` / `SegmentErrors` 与片段一一对应。
 - 某片段失败只令其覆盖点位失败，**已成功片段/点位完整保留**。
 - 全部成功 `OK=true, error==nil`；存在失败返回归一化 partial 错误，
-  `Succeeded`/`Failed` 明确，可区分"全部成功"与"部分失败"。
+  `Succeeded`/`Failed` 明确，且 `Failed == Rejected + Uncertain`，
+  可区分"全部成功"与"部分失败"。
+
+### 结果的三种确定程度（控制回路必须区分）
+
+每个点位的 `WriteResult.Status` 取以下三值之一，`PossibleApplied()` 是
+便于回路判读的快捷结论（"该控制量是否可能已在设备上生效"）：
+
+| Status | 含义 | PossibleApplied | 恢复/重发规则 |
+|--------|------|-----------------|---------------|
+| `StatusOK` | **已确认生效**：对端明确应答成功；或响应丢失后读回比对一致（此时 `Confirmed=true`） | true | 不再下发 |
+| `StatusRejected` | **确定没有生效**：静态校验失败（只读区/类型与宽度不符/地址重叠，无任何下发）或对端明确拒绝（异常响应 0x01–0x0B、非法地址/数据值、不支持功能码） | false | **绝不重发**，只下发一次，调用方不应再写 |
+| `StatusUncertain` | **可能已生效但最终未确认**：超时、连接失效、帧截断、校验/长度/事务标识错误等"响应可能丢失"类失败，已在 `MaxAttempts`（默认 3）内恢复仍无法确认 | true | 已在允许次数内处理完毕，**不会无休止重发**；设备真实值可能正是目标值，需上层/人工按"可能已生效"处置，而不是当作没写过 |
+
+即：**确定被拒绝的不会再发；不确定的只在 `MaxAttempts` 次以内处理**，
+且重复写入不会掺进成功结论——读回比对一致就立即停止下发并判成功。
+对应错误的 `MapError.Kind` 分别为 `rejected` 与 `uncertain`。
+
+### 并发下发的顺序与隔离保证
+
+- 底层会话仍是**单请求串行锁**：同一连接上的请求严格 FIFO、一一配对，
+  但它只能保证单次请求-响应不交叉。
+- 批量写回在其上再加一层**批次级互斥**（`*modbus.Client` 实现
+  `mapping.BatchGuard`，复用独立的批次锁；其他传输由映射层按传输加锁）：
+  **一个批次完整的"下发—读回确认—恢复重发"循环是不可被其他批次插入的整体**。
+  因此同一传输上多批并发写同一片区域、同一批点位时：
+  - 本批的读回比对到的**只能是本批写下的值**，不会读到别的批次的中间态，
+    也就不会把别的批次的值误当成本批的确认结果；
+  - 本批的恢复重发**不会覆盖别的批次刚刚写成功的控制量**；
+  - 批次严格串行、顺序确定，每个批次返回的成功/失败与其自身写入一致，
+    最终设备状态与最后一个成功批次报告的值一致（不会出现"双方都报成功、
+    设备最终值却对不上"的串台）。
+- 规划阶段（只读区/类型/宽度/重叠校验）不产生任何报文，也在批次锁之外完成；
+  只有物理下发、读回与重发在锁内。
 
 ### 恢复与确认语义（安全优先）
 
@@ -199,19 +233,21 @@ TCP 声明了长度、也确实收到了部分体字节但在超时/断开前没
 - **不确定失败才允许恢复**：超时、连接失效、帧截断、校验/长度/事务标识错误 ——
   这些情况下请求**可能已经生效**。此时不盲目重发，而是先**读回**该片段覆盖区间，
   与期望载荷逐位/逐寄存器比对：
-  - 读回一致 → 判**成功**，`Confirmed=true`，且**不重复下发**
+  - 读回一致 → 判**成功**，`Status=StatusOK`、`Confirmed=true`，且**不重复下发**
     （"响应丢失但实际写成功"不会被误报失败）；
   - 读回不一致或读回本身失败 → 在 `WriteConfig.MaxAttempts`（默认 3）内**重新下发**；
     0x05/0x06/0x0F/0x10 都是**绝对值写入、幂等**，重发不会产生叠加或歧义；
-  - 次数耗尽后再做一次读回，仍无法确认才判失败 —— **绝不把没确认生效的写入
-    报成成功**。
+  - 次数耗尽后再做一次读回，仍无法确认才判失败，但状态明确标为
+    **`StatusUncertain`（可能已生效但未确认）** —— 绝不把没确认生效的写入
+    报成成功，也不与"确定没生效"混为一谈，更不会超过 `MaxAttempts` 无休止重发。
   - 读回确认默认开启（`WriteConfig.Confirm` 取 `ConfirmDefault`/`ConfirmOn`）；
-    显式传 `ConfirmOff` 可关闭，此时不确定失败直接在次数内重发、耗尽即失败。
+    显式传 `ConfirmOff` 可关闭，此时不确定失败直接在次数内重发、耗尽同样标
+    `StatusUncertain`。
+- 对端明确拒绝/静态非法的点位结果为 `StatusRejected`，`PossibleApplied()==false`，
+  与上面的 `StatusUncertain`（`PossibleApplied()==true`）在结果字段上即可直接区分。
 - 底层客户端在每次物理尝试上仍保持原有保证：串行锁 FIFO、新事务标识、
   失败即重建连接、旧连接迟到响应随关闭丢弃，因此读回确认与重发都不会把
-  迟到响应或重复写入混成新结果。
-- 并发多批次写回互不串台：每批次独立结果对象、地址区间校验独立，
-  底层请求经串行锁一一配对（`-race` 下有对应用例）。
+  迟到响应或重复写入混成新结果。批次级隔离见上一节"并发下发的顺序与隔离保证"。
 
 ## 模拟从站与故障注入
 
@@ -244,6 +280,17 @@ go test -race ./... -count=1
 # 只跑写回相关用例（mapping 层与端到端）
 go test ./pkg/mapping/ -run 'TestEncode|TestPlanWrite|TestWriteBatch' -v -count=1
 go test . -run TestEndToEndWrite -v -count=1
+
+# 本次修复重点关注的三条行为（可单独复跑）：
+# 1) 多批并发写同一区域的批次隔离/顺序与最终状态一致性
+go test ./pkg/mapping/ -run TestWriteBatchSameRegion -v -count=20
+go test . -run TestEndToEndConcurrentSameRegionIsolation -v -race -count=5
+# 2) 响应丢失且可能已生效：StatusUncertain 标注与 MaxAttempts 重发边界
+go test ./pkg/mapping/ -run 'TestWriteBatchUncertain' -v -count=1
+go test . -run TestEndToEndWriteUncertainStatusDistinctFromReject -v -count=1
+# 3) 明确拒绝不重发：StatusRejected 且只下发一次
+go test ./pkg/mapping/ -run 'TestWriteBatchRejected|TestWriteBatchDefiniteReject' -v -count=1
+go test . -run TestEndToEndWriteExceptionNotRetried -v -count=1
 
 # 查看单测日志：打印原始报文 raw=... 与归一化判定 normalized=...
 go test ./pkg/modbus/ -v -count=1
@@ -284,5 +331,14 @@ res, err := gw.ReadAll()
 wres, werr := gw.WriteAll(map[string]any{
     "temp": float32(37.2),
 }, mapping.WriteConfig{MaxAttempts: 3})
-// wres.Results 与点位同序;Attempts 为下发次数,Confirmed 表示经读回确认
+// wres.Results 与点位同序;Attempts 为下发次数,Confirmed 表示经读回确认。
+// Status 区分三种结论,控制回路据此决定动作:
+for _, r := range wres.Results {
+    switch r.Status {
+    case mapping.StatusOK:                     // 已确认生效(可能 Confirmed=true)
+    case mapping.StatusRejected:               // 确定没生效,不要再发
+    case mapping.StatusUncertain:              // 可能已生效但未确认,需上层确认
+        _ = r.PossibleApplied()                // uncertain/OK 为 true,rejected 为 false
+    }
+}
 ```

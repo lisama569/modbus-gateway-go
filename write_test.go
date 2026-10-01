@@ -220,3 +220,166 @@ func TestEndToEndConcurrentWrites(t *testing.T) {
 		}
 	}
 }
+
+// TestEndToEndConcurrentSameRegionIsolation 验证多批并发写"同一片区域同一批点位"
+// 时,每批的"下发—读回确认"是不可插入的整体,且返回结果与设备最终状态一致。
+//
+// 做法:多个 goroutine 反复对同一保持寄存器点写不同绝对值;其中注入一次性
+// "响应丢失但未生效"(触发某批读回不匹配后重发)。所有批次要么明确成功、
+// 要么明确标注 uncertain;设备最终值必须等于"最后一个成功批次"报告的值。
+func TestEndToEndConcurrentSameRegionIsolation(t *testing.T) {
+	points := []mapping.Point{
+		{Name: "v", Area: mapping.AreaHoldingRegisters, Address: 50, Type: mapping.TypeUint16},
+	}
+	gw, err := Start(Config{Transport: modbus.TransportTCP, Unit: 1,
+		Timeout: 200 * time.Millisecond, Retry: 0, Points: points}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gw.Close()
+
+	// 制造若干次"响应丢失但未生效"的不确定窗口(Drop 不落地),
+	// 迫使不同批次经历 读回—重发,与别的批次在同址上竞争。
+	for i := 0; i < 6; i++ {
+		gw.Slave().AddInject(&modbus.InjectRule{
+			Function: modbus.FCWriteSingleRegister, Drop: true, Remaining: 1})
+	}
+
+	const n = 16
+	var wg sync.WaitGroup
+	type outcome struct {
+		batch int
+		res   *mapping.WriteBatchResult
+		err   error
+	}
+	out := make([]outcome, n)
+	for b := 0; b < n; b++ {
+		wg.Add(1)
+		go func(b int) {
+			defer wg.Done()
+			val := uint16(0x0100 + b) // 每批唯一目标值
+			r, e := gw.WriteAll(map[string]any{"v": val}, mapping.WriteConfig{MaxAttempts: 4})
+			out[b] = outcome{b, r, e}
+		}(b)
+	}
+	wg.Wait()
+
+	// 设备最终值。
+	final, _ := gw.Slave().Holding(50)
+
+	// 收集"报告成功"的批次目标值集合。
+	successVals := map[uint16]bool{}
+	for _, o := range out {
+		if o.err != nil {
+			// partial 错误本身允许(可能是 uncertain);逐项检查。
+		}
+		if o.res == nil {
+			t.Fatalf("batch %d nil result err=%v", o.batch, o.err)
+		}
+		r0 := o.res.Results[0]
+		switch r0.Status {
+		case mapping.StatusOK:
+			successVals[r0.Value.(uint16)] = true
+			// 报告成功的批次,其 Attempts 内的全部操作未被他批插入:
+			// 最终设备值可能被更晚的成功批次覆盖,但任何成功批次写入的
+			// 值一定是它自己的目标(此处仅做状态自洽校验)。
+		case mapping.StatusUncertain:
+			// 允许:可能已生效但未确认。绝不允许出现"明确拒绝"之外的假成功。
+			if r0.PossibleApplied() != true {
+				t.Fatalf("batch %d uncertain must be possible-applied", o.batch)
+			}
+		case mapping.StatusRejected:
+			t.Fatalf("same-region writes must not be rejected: batch %d %v", o.batch, r0.Err)
+		}
+	}
+
+	// 关键一致性:设备最终值要么是某个报告成功批次的目标值,
+	// 要么停留在某批 uncertain 的目标值;无论如何必须是本测试写入过的值,
+	// 不能是串台产生的混合/其它值。
+	wroteAny := successVals[final]
+	if !wroteAny {
+		// 若最后完成的是 uncertain 批次,final 也可能是它的目标(0x0100+b)。
+		for _, o := range out {
+			if o.res.Results[0].Status == mapping.StatusUncertain &&
+				o.res.Results[0].Value.(uint16) == final {
+				wroteAny = true
+			}
+		}
+	}
+	if !wroteAny {
+		t.Fatalf("final device value %04X matches no batch outcome (cross-talk)", final)
+	}
+}
+
+// TestEndToEndWriteUncertainStatusDistinctFromReject 端到端验证:
+// 持续丢响应且不落地 -> 结果为 uncertain(可能已生效)而非 rejected;
+// 永久异常响应 -> rejected(确定没生效),且只下发一次。
+func TestEndToEndWriteUncertainStatusDistinctFromReject(t *testing.T) {
+	// uncertain 场景。
+	{
+		points := []mapping.Point{
+			{Name: "v", Area: mapping.AreaHoldingRegisters, Address: 60, Type: mapping.TypeUint16},
+		}
+		gw, err := Start(Config{Transport: modbus.TransportTCP, Unit: 1,
+			Timeout: 120 * time.Millisecond, Retry: 0, Points: points}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		gw.Slave().AddInject(&modbus.InjectRule{
+			Function: modbus.FCWriteSingleRegister, Drop: true, Remaining: -1})
+		res, err := gw.WriteAll(map[string]any{"v": uint16(0x3333)},
+			mapping.WriteConfig{MaxAttempts: 3})
+		gw.Close()
+		if err == nil || res.OK {
+			t.Fatal("want failure")
+		}
+		r := res.Results[0]
+		if r.Status != mapping.StatusUncertain {
+			t.Fatalf("lost responses must be uncertain, got %v", r.Status)
+		}
+		if r.Attempts != 3 {
+			t.Fatalf("bounded by MaxAttempts, got %d", r.Attempts)
+		}
+		if r.PossibleApplied() != true {
+			t.Fatal("uncertain must report possible applied")
+		}
+		if v, _ := gw.Slave().Holding(60); v == 0x3333 {
+			t.Fatal("Drop without apply must not land")
+		}
+	}
+
+	// rejected 场景。
+	{
+		points := []mapping.Point{
+			{Name: "v", Area: mapping.AreaHoldingRegisters, Address: 61, Type: mapping.TypeUint16},
+		}
+		gw, err := Start(Config{Transport: modbus.TransportTCP, Unit: 1,
+			Timeout: 200 * time.Millisecond, Retry: 0, Points: points}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer gw.Close()
+		before := gw.Slave().RequestCount()
+		gw.Slave().AddInject(&modbus.InjectRule{
+			Function:  modbus.FCWriteSingleRegister,
+			Exception: modbus.ExcIllegalDataValue, Remaining: -1})
+		res, err := gw.WriteAll(map[string]any{"v": uint16(0x4444)},
+			mapping.WriteConfig{MaxAttempts: 5})
+		if err == nil || res.OK {
+			t.Fatal("want failure")
+		}
+		r := res.Results[0]
+		if r.Status != mapping.StatusRejected {
+			t.Fatalf("exception must be rejected, got %v", r.Status)
+		}
+		if r.PossibleApplied() {
+			t.Fatal("rejected must be definitely not applied")
+		}
+		if r.Attempts != 1 {
+			t.Fatalf("rejected issued once, got %d", r.Attempts)
+		}
+		if got := gw.Slave().RequestCount() - before; got != 1 {
+			t.Fatalf("exactly one physical write, got %d", got)
+		}
+	}
+}

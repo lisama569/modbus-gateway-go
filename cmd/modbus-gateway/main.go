@@ -89,8 +89,8 @@ func main() {
 		log.Fatalf("write batch: %v", werr)
 	}
 	for _, r := range wres.Results {
-		fmt.Printf("written point=%-12s value=%v attempts=%d confirmed=%v\n",
-			r.Point.Name, r.Value, r.Attempts, r.Confirmed)
+		fmt.Printf("written point=%-12s value=%v status=%s attempts=%d confirmed=%v\n",
+			r.Point.Name, r.Value, r.Status, r.Attempts, r.Confirmed)
 	}
 
 	fmt.Println("== 写入响应丢失但设备已生效:期望读回确认成功且不重复下发 ==")
@@ -118,7 +118,7 @@ func main() {
 		log.Fatalf("write confirm: %v", cerr)
 	}
 	for _, r := range cres.Results {
-		fmt.Printf("confirmed point=%s attempts=%d confirmed=%v (0x07D0=2000 已落地,未重复下发)\n",
-			r.Point.Name, r.Attempts, r.Confirmed)
+		fmt.Printf("confirmed point=%s status=%s attempts=%d confirmed=%v (0x07D0=2000 已落地,未重复下发)\n",
+			r.Point.Name, r.Status, r.Attempts, r.Confirmed)
 	}
 }

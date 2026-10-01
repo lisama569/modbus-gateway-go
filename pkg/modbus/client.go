@@ -63,7 +63,18 @@ type Client struct {
 	conn   net.Conn
 	txnSeq uint16
 	closed bool
+
+	// batchMu 是批次级互斥锁,与单请求串行锁 mu 分离:
+	// 一个批量写回的完整"下发—读回确认—重发"循环会全程持有它,
+	// 期间对 Do 的每次调用仍按单请求路径加 mu,因此不能直接复用 mu。
+	batchMu sync.Mutex
 }
+
+// LockBatch / UnlockBatch 实现 mapping.BatchGuard:同一客户端上的批量写回
+// 严格串行。锁内包含该批次的全部物理操作(含读回确认与恢复重发),
+// 任何其他批次都不能插到某批次的下发与确认之间。
+func (c *Client) LockBatch()   { c.batchMu.Lock() }
+func (c *Client) UnlockBatch() { c.batchMu.Unlock() }
 
 // Dial 创建客户端并建立首条连接。
 func Dial(cfg ClientConfig) (*Client, error) {

@@ -19,17 +19,58 @@ type WriteRequest struct {
 	Value any
 }
 
+// WriteStatus 明确区分写回失败的确定程度,供控制回路决定后续动作。
+type WriteStatus int
+
+const (
+	// StatusOK 写入已确认生效:要么收到对端明确成功应答,
+	// 要么响应丢失后经读回比对一致(此时 Confirmed=true)。
+	StatusOK WriteStatus = iota
+	// StatusRejected 确定没有生效:静态校验失败(只读区/类型不符/宽度不符/
+	// 地址重叠)或对端明确拒绝(异常响应 0x01–0x0B、非法地址/数据值、
+	// 不支持功能码)。此类结果绝不重发,调用方也不应再下发。
+	StatusRejected
+	// StatusUncertain 可能已经生效但最终未能确认:失败原因是超时、连接失效、
+	// 帧截断、校验/长度/事务标识错误等"响应可能丢失"类不确定错误,
+	// 已在 MaxAttempts 内恢复(读回确认 + 幂等重发),仍无法确认设备最终状态。
+	// 控制回路必须把它与 StatusRejected 区别对待:
+	// 设备端的真实值可能正是本次目标值,需要人工/上层确认,而不是当作没写过。
+	StatusUncertain
+)
+
+// String 返回状态的稳定英文短名(便于日志与断言)。
+func (s WriteStatus) String() string {
+	switch s {
+	case StatusOK:
+		return "ok"
+	case StatusRejected:
+		return "rejected"
+	case StatusUncertain:
+		return "uncertain"
+	default:
+		return "unknown"
+	}
+}
+
 // WriteResult 是单个点位的写回结果,与输入同序。
 type WriteResult struct {
 	Index int
 	Point Point
 	Value any
+	// Status 是该点位写回结论的确定程度(见 WriteStatus)。
+	Status WriteStatus
 	// Attempts 是该点位所属片段的物理下发次数(含首次)。
 	Attempts int
 	// Confirmed 为 true 表示成功结论来自"响应丢失后的读回确认",
 	// 而非对端明确应答。
 	Confirmed bool
 	Err       error
+}
+
+// PossibleApplied 报告该点位是否"可能已经在设备上生效"。
+// StatusOK 一定已生效;StatusUncertain 可能已生效;StatusRejected 确定没生效。
+func (r WriteResult) PossibleApplied() bool {
+	return r.Status == StatusOK || r.Status == StatusUncertain
 }
 
 // WriteBatchResult 是一次批量写回的整体结论。
@@ -40,6 +81,11 @@ type WriteBatchResult struct {
 	Results   []WriteResult
 	Succeeded int
 	Failed    int
+	// Rejected 是"确定没生效"的点位数(静态校验失败 + 对端明确拒绝)。
+	Rejected int
+	// Uncertain 是"可能已生效但未确认"的点位数;
+	// Failed == Rejected + Uncertain。
+	Uncertain int
 	// Segments 是确定性拆分后的写入片段;校验失败的点位不属于任何片段。
 	Segments      []Segment
 	SegmentErrors []error
@@ -250,23 +296,33 @@ func isRetryable(err error) bool {
 	return true
 }
 
-// WriteBatch 按点位配置批量写回,带确定性拆分、单项失败、恢复与确认语义:
+// WriteBatch 按点位配置批量写回,带确定性拆分、单项失败、批次级隔离、
+// 恢复与确认语义:
 //
-//   - 静态校验失败(只读区/类型不符/重叠)的点位立即得到单项错误,不产生任何下发。
+//   - 静态校验失败(只读区/类型不符/重叠)的点位立即得到单项错误,不产生任何下发,
+//     状态为 StatusRejected(确定没生效)。
+//   - 整批的全部物理操作(下发 + 读回确认 + 恢复重发)在同一把批次锁内完成,
+//     同一传输上的并发批次严格串行:一个批次的"下发—确认"不会被别的批次插入,
+//     读回只反映本批写下的值,恢复重发也不会覆盖别的批次刚写成功的控制量。
 //   - 每个片段独立下发;片段失败只令该片段覆盖的点位失败,已成功片段保留。
-//   - 明确拒绝(异常响应、非法地址/数据值、不支持功能码)不重试,直接失败;
+//   - 明确拒绝(异常响应、非法地址/数据值、不支持功能码)不重试,直接失败,
+//     状态 StatusRejected(只下发一次,确定没生效);
 //     不确定错误(超时/连接失效/帧错误)先读回比对确认:
 //   - 读回值与本片段目标载荷一致 -> 判成功(Confirmed=true,Attempts 记录下发次数),
 //     即"请求可能已生效但响应丢失"不会被误报为失败;
-//   - 读回值不一致或读回本身失败 -> 在最大次数内重新下发(绝对值写,幂等安全);
-//   - 全部次数耗尽且无法确认 -> 判失败,绝不把未确认生效的写入报成成功。
-//   - 结果与输入同序,整体结论用 OK 区分全部成功/部分失败(返回 partial MapError)。
+//   - 读回值不一致或读回本身失败 -> 在最大次数内重新下发(绝对值写,幂等安全),
+//     绝不无限制重发;
+//   - 全部次数耗尽且最后读回仍无法确认 -> 判失败但状态为 StatusUncertain,
+//     明确表达"可能已生效但未确认",绝不把未确认生效的写入报成成功。
+//   - 结果与输入同序,整体结论用 OK 区分全部成功/部分失败(返回 partial MapError),
+//     Rejected/Uncertain 分别汇总两类失败的数量。
 func WriteBatch(w WriteTransport, reqs []WriteRequest, cfg WriteConfig) (*WriteBatchResult, error) {
 	cfg = cfg.withDefaults()
 	if len(reqs) == 0 {
 		return nil, &MapError{Kind: "plan", Msg: "no points to write"}
 	}
 
+	// 规划阶段只做静态校验与确定性拆分,不产生任何物理报文。
 	segs, pointErrs := PlanWriteSegments(reqs)
 	res := &WriteBatchResult{
 		Results:       make([]WriteResult, len(reqs)),
@@ -274,81 +330,129 @@ func WriteBatch(w WriteTransport, reqs []WriteRequest, cfg WriteConfig) (*WriteB
 		SegmentErrors: make([]error, len(segs)),
 	}
 	for i := range reqs {
-		res.Results[i] = WriteResult{Index: i, Point: reqs[i].Point, Value: reqs[i].Value}
+		res.Results[i] = WriteResult{
+			Index: i, Point: reqs[i].Point, Value: reqs[i].Value,
+			Status: StatusOK,
+		}
+		// 静态校验失败(只读区/类型不符/宽度不符/地址重叠)是"确定没生效":
+		// 不产生任何下发,标记为明确拒绝。
 		if pointErrs[i] != nil {
-			res.Results[i].Err = pointErrs[i]
+			pr := &res.Results[i]
+			pr.Err = pointErrs[i]
+			pr.Status = StatusRejected
 		}
 	}
 
+	// 执行阶段:整个批次的全部物理下发、读回确认与恢复重发放在同一把批次锁内,
+	// 构成不可被其他批次插入的原子整体。这样:
+	//   - 本批读回比对到的只能是本批写下的值(不会读到别的批次的中间态);
+	//   - 本批的恢复重发不会覆盖其他批次刚刚写成功的控制量;
+	//   - 返回结果与设备最终状态一致。
+	unlock := lockBatchFor(w)
+	defer unlock()
 	for si, seg := range segs {
-		attempts, confirmed, werr := writeSegment(w, seg, reqs, cfg)
-		res.SegmentErrors[si] = werr
+		out := writeSegment(w, seg, reqs, cfg)
+		res.SegmentErrors[si] = out.err
 		for _, pi := range seg.Points {
 			pr := &res.Results[pi]
-			pr.Attempts = attempts
-			pr.Confirmed = confirmed
-			if werr != nil {
+			pr.Attempts = out.attempts
+			pr.Confirmed = out.confirmed
+			pr.Status = out.status
+			if out.err != nil {
+				kind := "transport"
+				if out.status == StatusUncertain {
+					kind = "uncertain"
+				} else if out.status == StatusRejected {
+					kind = "rejected"
+				}
 				pr.Err = &MapError{
-					Kind: "transport",
+					Kind: kind,
 					Msg: "write segment @" + areaName(seg.Area) + "+" +
-						itoaLenM(int(seg.Address)) + " failed after " +
-						itoaLenM(attempts) + " attempt(s): " + werr.Error(),
+						itoaLenM(int(seg.Address)) + " " + out.status.String() +
+						" after " + itoaLenM(out.attempts) + " attempt(s): " +
+						out.err.Error(),
 				}
 			}
 		}
 	}
 
 	for i := range res.Results {
-		if res.Results[i].Err != nil {
-			res.Failed++
-		} else {
+		switch res.Results[i].Status {
+		case StatusOK:
 			res.Succeeded++
+		case StatusRejected:
+			res.Failed++
+			res.Rejected++
+		default:
+			res.Failed++
+			res.Uncertain++
 		}
 	}
 	res.OK = res.Failed == 0
 	if !res.OK {
 		return res, &MapError{Kind: "partial",
 			Msg: itoaLenM(res.Succeeded) + " point(s) written, " +
-				itoaLenM(res.Failed) + " failed"}
+				itoaLenM(res.Rejected) + " rejected, " +
+				itoaLenM(res.Uncertain) + " unconfirmed"}
 	}
 	return res, nil
 }
 
-// writeSegment 执行一个写入片段的完整"下发-确认"循环。
-// 返回物理下发次数、成功是否来自读回确认、最终错误(nil 表示成功)。
+// segmentOutcome 是一个片段完整"下发—确认"循环的结论。
+type segmentOutcome struct {
+	// attempts 是物理下发次数(含首次,>=1)。
+	attempts int
+	// confirmed 为 true 表示成功来自响应丢失后的读回确认。
+	confirmed bool
+	// status 为最终状态:StatusOK / StatusRejected / StatusUncertain。
+	status WriteStatus
+	// err 为最终错误;status==StatusOK 时为 nil。
+	err error
+}
+
+// writeSegment 执行一个写入片段的完整"下发-确认"循环(调用方须持有批次锁)。
+//
+// 返回的 segmentOutcome.status 严格区分三种结论:
+//   - StatusOK:对端明确应答成功,或响应丢失后读回比对一致(confirmed=true);
+//   - StatusRejected:对端明确拒绝(异常响应/非法地址/不支持功能码)。
+//     只下发一次,绝不重发,确定没有生效;
+//   - StatusUncertain:全部尝试(每次失败后读回确认,不一致才幂等重发)耗尽,
+//     最后读回仍无法确认。最后一帧可能已经生效,绝不能报成功,也不能与
+//     "确定没生效"混为一谈。
 func writeSegment(w WriteTransport, seg Segment, reqs []WriteRequest,
-	cfg WriteConfig) (attempts int, confirmed bool, err error) {
+	cfg WriteConfig) segmentOutcome {
 	var lastErr error
-	for attempts = 1; attempts <= cfg.MaxAttempts; attempts++ {
+	for attempt := 1; attempt <= cfg.MaxAttempts; attempt++ {
 		werr := issueSegmentWrite(w, seg, reqs)
 		if werr == nil {
-			return attempts, false, nil // 对端明确应答
+			return segmentOutcome{attempts: attempt, status: StatusOK} // 对端明确应答
 		}
 		lastErr = werr
 		if !isRetryable(werr) {
-			// 明确拒绝:绝不再次下发。
-			return attempts, false, werr
+			// 明确拒绝:绝不再次下发,确定没有生效。
+			return segmentOutcome{attempts: attempt, status: StatusRejected, err: werr}
 		}
 		if cfg.confirmEnabled() {
 			// 不确定:先读回确认,避免把已生效的控制量误报失败,
 			// 也避免无意义的重复下发。
 			ok, _ := segmentConfirmed(w, seg, reqs)
 			if ok {
-				return attempts, true, nil
+				return segmentOutcome{attempts: attempt, confirmed: true, status: StatusOK}
 			}
 			// 值不一致或读回也失败:继续下一轮重发(幂等绝对值写)。
 		}
-		// 未开启确认或未确认成功:继续下一轮重发。
+		// 未开启确认或未确认成功:继续下一轮重发,且重发不超过 MaxAttempts。
 		lastErr = &MapError{Kind: "uncertain",
 			Msg: "write outcome unconfirmed: " + werr.Error()}
 	}
 	// 次数耗尽前再做一次读回(仅确认模式):最后一帧仍可能已生效。
 	if cfg.confirmEnabled() {
 		if ok, _ := segmentConfirmed(w, seg, reqs); ok {
-			return cfg.MaxAttempts, true, nil
+			return segmentOutcome{attempts: cfg.MaxAttempts, confirmed: true, status: StatusOK}
 		}
 	}
-	return cfg.MaxAttempts, false, lastErr
+	// 已在允许次数内处理完仍无法确认:可能已生效,明确标注为 uncertain。
+	return segmentOutcome{attempts: cfg.MaxAttempts, status: StatusUncertain, err: lastErr}
 }
 
 // issueSegmentWrite 按片段区域与宽度选择功能码下发一次:
