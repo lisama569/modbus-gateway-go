@@ -180,11 +180,25 @@ TCP 声明了长度、也确实收到了部分体字节但在超时/断开前没
 4. 单点片段用单写功能码（0x05 / 0x06），多点连续片段用多写（0x0F / 0x10）。
 5. 同一点位集合的拆分结果与输入顺序无关，完全确定。
 
-### 结果规则（同序、保留成功项）
+### 结果规则（同序、保留成功项、确定程度可区分）
 
 - `WriteBatchResult.Results` 与输入请求**同序一一对应**，每项携带值、
-  物理下发次数 `Attempts`、是否经读回确认 `Confirmed` 与错误；
-  `Segments` / `SegmentErrors` 与片段一一对应。
+  结论状态 `Status`、物理下发次数 `Attempts`、是否经读回确认 `Confirmed`
+  与错误；`Segments` / `SegmentErrors` 与片段一一对应。
+- `WriteResult.Status` 明确区分五种结论，供控制回路决定后续动作：
+
+  | Status | 含义 | 设备最终值 | 是否可继续重发 |
+  |--------|------|-----------|----------------|
+  | `StatusWritten` | 对端明确应答成功 | 确定等于本批目标值 | 不需要 |
+  | `StatusConfirmed` | 响应丢失后**读回比对一致**确认成功 | 确定等于本批目标值 | 不需要 |
+  | `StatusRejected` | 对端**明确拒绝**（异常响应/非法地址/非法值/不支持功能码） | **确定未生效** | 不应重发 |
+  | `StatusUncertain` | 超时/连接失效等**响应丢失**、次数耗尽且读回也无法确认 | **未知，可能已生效** | 次数已用尽，交调用方按未知处理 |
+  | `StatusInvalid` | 静态校验失败（只读区/类型不符/重叠等） | 确定未生效（零下发） | 修改请求后才可重试 |
+
+  另提供便捷判定：`r.Succeeded()`（Written 或 Confirmed）、
+  `r.Uncertain()`、`r.Rejected()`。`r.Err` 归一化为 `*mapping.MapError`：
+  明确拒绝为 `Kind="transport"`，不确定为 `Kind="uncertain"`，
+  底层 `*modbus.Error` 保留在错误链上（可用 `errors.As/Is` 追溯具体原因与异常码）。
 - 某片段失败只令其覆盖点位失败，**已成功片段/点位完整保留**。
 - 全部成功 `OK=true, error==nil`；存在失败返回归一化 partial 错误，
   `Succeeded`/`Failed` 明确，可区分"全部成功"与"部分失败"。
@@ -193,25 +207,51 @@ TCP 声明了长度、也确实收到了部分体字节但在超时/断开前没
 
 写操作区分两类失败，恢复策略不同：
 
-- **明确拒绝 / 参数非法，绝不重发**：异常响应（0x01–0x0B）、非法地址/数据值、
-  不支持功能码等属于对端的确定答复，立即判该片段失败（只下发一次）。
+- **明确拒绝 / 参数非法，绝不重发（结果 StatusRejected）**：异常响应
+  （0x01–0x0B）、非法地址/数据值、不支持功能码等属于对端的确定答复，
+  立即判该片段失败（**只下发一次，也不做读回**），并明确标注"确定未生效"。
   这类判定复用 `*modbus.Error` 的错误分类（`Error.Retryable()`）。
-- **不确定失败才允许恢复**：超时、连接失效、帧截断、校验/长度/事务标识错误 ——
-  这些情况下请求**可能已经生效**。此时不盲目重发，而是先**读回**该片段覆盖区间，
-  与期望载荷逐位/逐寄存器比对：
-  - 读回一致 → 判**成功**，`Confirmed=true`，且**不重复下发**
-    （"响应丢失但实际写成功"不会被误报失败）；
-  - 读回不一致或读回本身失败 → 在 `WriteConfig.MaxAttempts`（默认 3）内**重新下发**；
-    0x05/0x06/0x0F/0x10 都是**绝对值写入、幂等**，重发不会产生叠加或歧义；
-  - 次数耗尽后再做一次读回，仍无法确认才判失败 —— **绝不把没确认生效的写入
-    报成成功**。
-  - 读回确认默认开启（`WriteConfig.Confirm` 取 `ConfirmDefault`/`ConfirmOn`）；
-    显式传 `ConfirmOff` 可关闭，此时不确定失败直接在次数内重发、耗尽即失败。
-- 底层客户端在每次物理尝试上仍保持原有保证：串行锁 FIFO、新事务标识、
-  失败即重建连接、旧连接迟到响应随关闭丢弃，因此读回确认与重发都不会把
-  迟到响应或重复写入混成新结果。
-- 并发多批次写回互不串台：每批次独立结果对象、地址区间校验独立，
-  底层请求经串行锁一一配对（`-race` 下有对应用例）。
+- **"可能已生效但未确认"单独标注（结果 StatusUncertain）**：超时、连接失效、
+  帧截断、校验/长度/事务标识错误等情况下请求**可能已经生效**。处理顺序：
+  1. 不盲目重发，先**读回**该片段覆盖区间，与期望载荷逐位/逐寄存器比对；
+  2. 读回一致 → 判**成功**（`StatusConfirmed`，`Attempts=1`），**不重复下发**
+     ——"响应丢失但实际写成功"不会被误报失败；
+  3. 读回不一致或读回本身失败 → 在 `WriteConfig.MaxAttempts`（默认 3）内
+     **重新下发**；0x05/0x06/0x0F/0x10 都是**绝对值写入、幂等**，重发不产生
+     叠加或歧义；
+  4. 次数耗尽后再做一次最终读回，仍无法确认才判 `StatusUncertain`
+     —— 既**不把未确认生效的写入报成成功**，也**不把它等同为"确定没生效"**，
+     更不会无限重发：物理下发严格不超过 `MaxAttempts`，耗尽后零额外写入。
+  5. 读回确认默认开启（`Confirm` 取 `ConfirmDefault`/`ConfirmOn`）；显式传
+     `ConfirmOff` 时不确定失败直接在次数内重发、耗尽同样判 `StatusUncertain`。
+- 控制回路应对建议：`StatusRejected/StatusInvalid` 可安全放弃（确定没写进去）；
+  `StatusUncertain` 必须当作**未知量**（不要直接按旧值再次覆盖），由上层决定
+  是人工介入还是下一个控制周期以新的目标值安全重写。
+
+### 并发下发的顺序与隔离保证
+
+多个批次（goroutine）并发写回同一连接时，保证如下（入口为 `mapping.WriteBatch`、
+`mapping.NewWriter(w).WriteBatch`，网关 `gw.WriteAll/WriteRequests` 内部同样持有
+`Writer`；同一底层传输自动共享同一把区间锁表）：
+
+1. **按区间互斥的整批原子性**：每个数据区按写入片段的精确地址区间加锁，
+   一批在该区的**全部"下发—读回确认—必要重发"**在一次占有内完成，期间任何
+   覆盖重叠地址的批次都被阻塞在该批完成之后。由此杜绝"某批恢复时重发覆盖另一批
+   刚写成功的值"或"某批的确认读到的是别批写下的值却当成自己成功"的串台：
+   每批的确认结果只反映它自己写下的值，返回成功时设备最终值与该批目标一致。
+2. **不相交即并发**：地址区间不相交（含同区带间隙、跨区）的批次互不阻塞，
+   间隙地址不会被任何批次顺带加锁。
+3. **顺序确定、无死锁**：锁按"数据区枚举序 + 区内地址升序"获取（全局统一顺序），
+   重叠批次按锁竞争顺序线性化，后完成者为最终值（last-writer-wins），
+   不存在循环等待。
+4. 底层客户端在每次物理尝试上仍保持原有保证：会话串行锁 FIFO、新事务标识、
+   失败即重建连接、旧连接迟到响应随关闭丢弃，因此读回确认与重发不会把迟到响应
+   或重复写入混成新结果。
+
+上述保证由确定性单测（`TestWriterOverlappingBatchesAtomicIssueConfirm`、
+`TestAreaLockSetOverlapAndDisjoint`）与端到端并发压力用例
+（`TestEndToEndOverlappingBatchesLostResponsesConsistent`，在"首次响应丢失且
+已生效"注入下多批写同一批点位）覆盖，并在 `-race` 下反复运行。
 
 ## 模拟从站与故障注入
 
@@ -234,16 +274,30 @@ SetCoil/SetDiscrete` 预置数据。`slave.AddInject(&modbus.InjectRule{...})` �
 
 ```bash
 # 运行全部单元/集成测试
-# （含畸形报文、校验、超时重试、连接重建、并发；以及写回往返转换、容量拆分、
-#   部分失败、明确拒绝不重试、不确定写入读回确认、并发下发不串台）
+# （含畸形报文、校验、超时重试、连接重建、并发读取；以及写回往返转换、容量拆分、
+#   部分失败、明确拒绝不重发、不确定写入读回确认、可能已生效/确定失败结果分类、
+#   多批并发写同一区域的区间隔离与最终状态一致性）
 go test ./... -count=1
 
-# 带竞态检测的并发验证
+# 带竞态检测的并发验证（建议重复多次以覆盖调度交错）
 go test -race ./... -count=1
+go test -race ./pkg/mapping/ . -count=10
 
 # 只跑写回相关用例（mapping 层与端到端）
-go test ./pkg/mapping/ -run 'TestEncode|TestPlanWrite|TestWriteBatch' -v -count=1
+go test ./pkg/mapping/ -run 'TestEncode|TestPlanWrite|TestWriteBatch|TestWriter|TestAreaLockSet' -v -count=1
 go test . -run TestEndToEndWrite -v -count=1
+
+# 本轮新增的三条关键保证可单独复跑：
+# 1) 多批并发写同一区域：确定性时序验证"下发—确认"原子性与最终状态一致
+go test ./pkg/mapping/ -run TestWriterOverlappingBatchesAtomicIssueConfirm -race -count=30 -v
+#    端到端：首次响应"已生效但丢失"注入下，8 批并发写同一批点位全部成功且无撕裂值
+go test . -run TestEndToEndOverlappingBatchesLostResponsesConsistent -race -count=5 -v
+# 2) 响应丢失且可能已生效：StatusUncertain 标注 + 物理下发不超过 MaxAttempts
+go test . -run TestEndToEndWriteUncertainWhenExhausted -v -count=1
+go test ./pkg/mapping/ -run TestWriteStatusUncertainExhaustedDistinguished -v -count=1
+# 3) 明确拒绝：StatusRejected、只下发一次、不读回不重发
+go test . -run TestEndToEndWriteRejectedStatus -v -count=1
+go test ./pkg/mapping/ -run 'TestWriteStatusRejectedDefinite|TestWriteBatchDefiniteRejectNotRetried' -v -count=1
 
 # 查看单测日志：打印原始报文 raw=... 与归一化判定 normalized=...
 go test ./pkg/modbus/ -v -count=1

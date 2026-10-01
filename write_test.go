@@ -108,6 +108,9 @@ func TestEndToEndWriteConfirmedAfterLostResponse(t *testing.T) {
 	if !res.Results[0].Confirmed {
 		t.Fatal("result must be marked Confirmed")
 	}
+	if res.Results[0].Status != mapping.StatusConfirmed {
+		t.Fatalf("want StatusConfirmed, got %s", res.Results[0].Status)
+	}
 	if res.Results[0].Attempts != 1 {
 		t.Fatalf("no re-issue after confirmation, attempts=%d", res.Results[0].Attempts)
 	}

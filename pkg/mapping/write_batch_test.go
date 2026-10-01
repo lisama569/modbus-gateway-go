@@ -123,6 +123,9 @@ func TestWriteBatchAllSuccess(t *testing.T) {
 			t.Fatalf("point %s attempts=%d confirmed=%v, want 1/false",
 				r.Point.Name, r.Attempts, r.Confirmed)
 		}
+		if r.Status != StatusWritten || !r.Succeeded() {
+			t.Fatalf("point %s want StatusWritten, got %s", r.Point.Name, r.Status)
+		}
 	}
 	if v := ft.holding[20]; v != 0xABCD {
 		t.Fatalf("uint16 not written: %04X", v)
@@ -189,6 +192,9 @@ func TestWriteBatchDefiniteRejectNotRetried(t *testing.T) {
 	if res.Results[0].Attempts != 1 || res.Results[0].Confirmed {
 		t.Fatalf("attempts=%d confirmed=%v", res.Results[0].Attempts, res.Results[0].Confirmed)
 	}
+	if res.Results[0].Status != StatusRejected || !res.Results[0].Rejected() {
+		t.Fatalf("want StatusRejected, got %s", res.Results[0].Status)
+	}
 	if ft.coils[5] {
 		t.Fatal("rejected write must not be applied")
 	}
@@ -213,6 +219,9 @@ func TestWriteBatchUncertainButAppliedConfirmed(t *testing.T) {
 	if !res.Results[0].Confirmed || res.Results[0].Attempts != 1 {
 		t.Fatalf("want confirmed via readback, got attempts=%d confirmed=%v",
 			res.Results[0].Attempts, res.Results[0].Confirmed)
+	}
+	if res.Results[0].Status != StatusConfirmed {
+		t.Fatalf("want StatusConfirmed, got %s", res.Results[0].Status)
 	}
 }
 
@@ -260,6 +269,10 @@ func TestWriteBatchUncertainExhaustedFails(t *testing.T) {
 	}
 	if res.Results[0].Err == nil || res.Results[0].Attempts != 3 {
 		t.Fatalf("result wrong: %+v", res.Results[0])
+	}
+	if res.Results[0].Status != StatusUncertain || !res.Results[0].Uncertain() {
+		t.Fatalf("exhausted uncertain must be StatusUncertain, got %s",
+			res.Results[0].Status)
 	}
 	if ft.holding[0] != 0 {
 		t.Fatal("unapplied write must not be visible")
@@ -310,6 +323,10 @@ func TestWriteBatchStaticFailuresNoIssue(t *testing.T) {
 	}
 	if res.Results[0].Err == nil || res.Results[1].Err == nil {
 		t.Fatal("both points must carry per-item errors")
+	}
+	if res.Results[0].Status != StatusInvalid || res.Results[1].Status != StatusInvalid {
+		t.Fatalf("static failures must be StatusInvalid, got %s/%s",
+			res.Results[0].Status, res.Results[1].Status)
 	}
 	if len(res.Segments) != 0 {
 		t.Fatalf("no segments expected for all-invalid batch, got %d", len(res.Segments))

@@ -1,6 +1,9 @@
 package mapping
 
-import "sort"
+import (
+	"errors"
+	"sort"
+)
 
 // 各数据区单次物理读取的容量上限(Modbus 规范)。
 const (
@@ -21,12 +24,32 @@ func pointWidth(p Point) uint16 {
 
 // MapError 是映射/批量读取层的错误,携带确定性的归一化原因。
 type MapError struct {
-	// Kind 为 "address" | "plan" | "decode" | "transport" | "partial"
+	// Kind 为 "address" | "plan" | "decode" | "transport" | "uncertain" | "partial"
+	//   - "transport":写回被对端明确拒绝等确定性传输失败(结果 StatusRejected);
+	//   - "uncertain":超时/连接失效等"可能已生效但未确认"(结果 StatusUncertain)。
 	Kind string
 	Msg  string
+	// Cause 是触发本错误的底层错误(可能为 nil)。
+	Cause error
 }
 
 func (e *MapError) Error() string { return "mapping: [" + e.Kind + "] " + e.Msg }
+
+func (e *MapError) Unwrap() error { return e.Cause }
+
+// Retryable 实现写回恢复判定:只有底层"响应可能丢失"类错误(经错误链上的
+// modbus 层 Retryable)才允许读回确认/重发;规划/值/地址/明确拒绝等
+// 确定性失败一律不可重试。
+func (e *MapError) Retryable() bool {
+	if e == nil || e.Cause == nil {
+		return false
+	}
+	var r interface{ Retryable() bool }
+	if errors.As(e.Cause, &r) {
+		return r.Retryable()
+	}
+	return false
+}
 
 // PlanSegments 按确定规则把点位拆分为物理读取片段:
 //

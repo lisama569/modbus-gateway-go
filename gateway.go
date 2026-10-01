@@ -26,6 +26,7 @@ type Gateway struct {
 	client *modbus.Client
 	slave  *modbus.Slave
 	points []mapping.Point
+	writer *mapping.Writer
 }
 
 // Start 启动本地模拟从站并连接会话客户端。
@@ -59,6 +60,7 @@ func Start(cfg Config, slave *modbus.Slave) (*Gateway, error) {
 		client: client,
 		slave:  slave,
 		points: cfg.Points,
+		writer: mapping.NewWriter(client),
 	}, nil
 }
 
@@ -82,12 +84,12 @@ func (g *Gateway) WriteAll(values map[string]any, cfg mapping.WriteConfig) (*map
 	for _, p := range g.points {
 		reqs = append(reqs, mapping.WriteRequest{Point: p, Value: values[p.Name]})
 	}
-	return mapping.WriteBatch(g.client, reqs, cfg)
+	return g.writer.WriteBatch(reqs, cfg)
 }
 
 // WriteRequests 对显式给出的写回请求执行批量写回。
 func (g *Gateway) WriteRequests(reqs []mapping.WriteRequest, cfg mapping.WriteConfig) (*mapping.WriteBatchResult, error) {
-	return mapping.WriteBatch(g.client, reqs, cfg)
+	return g.writer.WriteBatch(reqs, cfg)
 }
 
 // Client 暴露底层客户端,供直接按功能码访问。
